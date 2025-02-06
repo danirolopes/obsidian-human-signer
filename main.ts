@@ -2,54 +2,152 @@ import { App, Editor, Plugin, PluginSettingTab, Setting } from 'obsidian';
 import * as crypto from 'crypto';
 
 interface EditorChangeTrackerSettings {
-    keyPath: string; // Path to private key file or signing script
-    isScript: boolean; // Whether the path points to a signing script
+    keyPath: string; 
+    isScript: boolean; 
 }
 
 const DEFAULT_SETTINGS: EditorChangeTrackerSettings = {
-    keyPath: '', // User must provide their key/script path
+    keyPath: '', 
     isScript: false
 };
 
+class FileState {
+    previousContent: string = '';
+    lastLogTime: number | null = null;
+    logBuffer: string[] = [];
+    writeTimeout: number | null = null;
+    keyPressMap: Map<string, number> = new Map();
+
+    constructor(public filePath: string) {}
+
+    reset() {
+        this.previousContent = '';
+        this.lastLogTime = null;
+        this.logBuffer = [];
+        if (this.writeTimeout !== null) {
+            window.clearTimeout(this.writeTimeout);
+            this.writeTimeout = null;
+        }
+        this.keyPressMap.clear();
+    }
+}
+
 export default class EditorChangeTracker extends Plugin {
     settings: EditorChangeTrackerSettings;
-    private previousContent: string = '';
-    private lastLogTime: number | null = null;
-    private logBuffer: string[] = []; // Buffer to store logs before writing to file
-    private writeTimeout: number | null = null;
-    private currentFilePath: string | null = null; // Path of the currently edited file
+    private privateKey: string | null = null;
+    private fileStates: Map<string, FileState> = new Map();
+    private activeFilePath: string | null = null;
 
     async onload() {
         await this.loadSettings();
+        
+        if (!this.settings.isScript) {
+            try {
+                let privateKey = await this.app.vault.adapter.read(this.settings.keyPath);
+                
+                privateKey = privateKey.replace(/\r\n/g, '\n').trim();
+                if (!privateKey.startsWith('-----BEGIN PRIVATE KEY-----\n')) {
+                    privateKey = '-----BEGIN PRIVATE KEY-----\n' + privateKey;
+                }
+                if (!privateKey.endsWith('\n-----END PRIVATE KEY-----')) {
+                    privateKey = privateKey + '\n-----END PRIVATE KEY-----';
+                }
+                
+                this.privateKey = privateKey;
+            } catch (error) {
+                console.error('Failed to load private key:', error);
+                throw new Error('Failed to load private key: ' + error.message);
+            }
+        }
 
-        // Register the editor change event
+        // Register for file open events
         this.registerEvent(
-            this.app.workspace.on('editor-change', (editor: Editor, info: any) => {
-                const file = this.app.workspace.getActiveFile();
+            this.app.workspace.on('file-open', async (file) => {
                 if (file) {
-                    this.currentFilePath = file.path;
-                    const currentContent = editor.getValue();
-                    const cursorPosition = editor.getCursor(); // Get the cursor position
-                    this.logChange(this.previousContent, currentContent, cursorPosition);
-                    this.previousContent = currentContent; // Update the previous content
+                    // If there was a previously active file, save its state before switching
+                    if (this.activeFilePath && this.activeFilePath !== file.path) {
+                        await this.writeLogBufferToFile(this.fileStates.get(this.activeFilePath)!);
+                    }
+                    
+                    this.activeFilePath = file.path;
+                    if (!this.fileStates.has(file.path)) {
+                        const fileState = new FileState(file.path);
+                        this.fileStates.set(file.path, fileState);
+                        // Initialize the previous content with the current file content
+                        fileState.previousContent = await this.app.vault.read(file);
+                    }
+                    await this.checkLogfileConsistency();
+                } else {
+                    // File is being closed
+                    if (this.activeFilePath) {
+                        const fileState = this.fileStates.get(this.activeFilePath);
+                        if (fileState) {
+                            // Write any pending changes before removing the state
+                            await this.writeLogBufferToFile(fileState);
+                            fileState.reset();
+                            this.fileStates.delete(this.activeFilePath);
+                        }
+                    }
+                    this.activeFilePath = null;
                 }
             })
         );
 
-        // Add a settings tab
+        this.registerEvent(
+            this.app.workspace.on('editor-change', (editor: Editor, info: any) => {
+                const file = this.app.workspace.getActiveFile();
+                if (file) {
+                    this.activeFilePath = file.path;
+                    if (!this.fileStates.has(file.path)) {
+                        this.fileStates.set(file.path, new FileState(file.path));
+                    }
+                    const fileState = this.fileStates.get(file.path)!;
+                    const currentContent = editor.getValue();
+                    const cursorPosition = editor.getCursor();
+                    this.logChange(fileState, currentContent, cursorPosition);
+                    fileState.previousContent = currentContent;
+                }
+            })
+        );
+
+        this.registerDomEvent(document, 'keydown', (event: KeyboardEvent) => {
+            if (!this.activeFilePath) return;
+            const fileState = this.fileStates.get(this.activeFilePath);
+            if (!fileState) return;
+
+            const key = event.key;
+            if (!fileState.keyPressMap.has(key)) {
+                fileState.keyPressMap.set(key, window.performance.now());
+            }
+        });
+
+        this.registerDomEvent(document, 'keyup', (event: KeyboardEvent) => {
+            if (!this.activeFilePath) return;
+            const fileState = this.fileStates.get(this.activeFilePath);
+            if (!fileState) return;
+
+            const key = event.key;
+            if (fileState.keyPressMap.has(key)) {
+                fileState.keyPressMap.set(key, -1);
+            }
+        });
+
+        // Clean up stale key presses for all files periodically
+        setInterval(() => {
+            for (const fileState of this.fileStates.values()) {
+                this.cleanupStaleKeyPressTimes(fileState);
+            }
+        }, 60000);
+
         this.addSettingTab(new EditorChangeTrackerSettingTab(this.app, this));
     }
 
-    // Get the logfile path based on the currently edited file
     getLogFilePath(): string | null {
-        if (!this.currentFilePath) return null;
-
-        // Generate the logfile name by replacing the file extension with .log and adding a dot
-        const logFileName = `.${this.currentFilePath.replace(/\.[^/.]+$/, '')}.log`;
+        if (!this.activeFilePath) return null;
+        const logFileName = `.${this.activeFilePath.replace(/\.[^/.]+$/, '')}.log`;
         return logFileName;
     }
 
-    // Check logfile consistency on plugin load
     async checkLogfileConsistency() {
         const logFilePath = this.getLogFilePath();
         if (!logFilePath) return;
@@ -57,7 +155,6 @@ export default class EditorChangeTracker extends Plugin {
         try {
             const logContent = await this.app.vault.adapter.read(logFilePath);
 
-            // Extract the last hash and signature from the logfile
             const hashMatch = logContent.match(/HASH: (.+)\n/);
             const signatureMatch = logContent.match(/SIGNATURE: (.+)\n/);
 
@@ -65,88 +162,136 @@ export default class EditorChangeTracker extends Plugin {
                 const lastHash = hashMatch[1];
                 const lastSignature = signatureMatch[1];
 
-                // Remove the last hash and signature from the log content
                 const cleanedLogContent = logContent.replace(/\nHASH: .*\nSIGNATURE: .*\n$/, '');
-
-                // Calculate the hash of the cleaned log content
+                
                 const calculatedHash = crypto.createHash('sha256').update(cleanedLogContent).digest('hex');
-
-                // Verify the hash and signature
                 const verify = crypto.createVerify('sha256');
                 verify.update(calculatedHash);
-                const isSignatureValid = verify.verify(this.settings.privateKey, lastSignature, 'hex');
+				
+                if (!this.settings.isScript && !this.privateKey) {
+                    throw new Error('Private key not loaded');
+                }
+
+                const isSignatureValid = this.settings.isScript ? 
+                    await this.verifyWithExternalScript(calculatedHash, lastSignature) :
+                    verify.verify(this.privateKey!, lastSignature, 'hex');
 
                 if (calculatedHash !== lastHash || !isSignatureValid) {
-                    // Logfile is inconsistent, fix it
                     await this.fixLogfileInconsistency(cleanedLogContent, logFilePath);
                 }
             }
 
-            // Reconstruct the text from the logfile and compare it with the actual file
             await this.checkTextConsistency(logFilePath);
         } catch (error) {
-            // Logfile does not exist or is empty, ignore
+            // If the file doesn't exist, create it with initial content
+            if (error.code === 'ENOENT') {
+                const file = this.app.workspace.getActiveFile();
+                if (file) {
+                    const currentContent = await this.app.vault.read(file);
+                    const initialLogEntry = `[MACHINE] @0 +${this.escapeText(currentContent)}\n`;
+                    
+                    const hash = crypto.createHash('sha256').update(initialLogEntry).digest('hex');
+                    const sign = crypto.createSign('sha256');
+                    sign.update(hash);
+                    const signature = this.settings.isScript ? 
+                        await this.signWithExternalScript(hash) :
+                        sign.sign(this.privateKey!, 'hex');
+
+                    const finalLogContent = `${initialLogEntry}\nHASH: ${hash}\nSIGNATURE: ${signature}\n`;
+                    await this.app.vault.adapter.write(logFilePath, finalLogContent);
+                }
+            } else {
+                console.error('Error checking logfile consistency:', error);
+            }
         }
     }
 
-    // Fix logfile inconsistency
     async fixLogfileInconsistency(cleanedLogContent: string, logFilePath: string) {
         const machineLogEntry = `[MACHINE] @0 +Logfile inconsistency detected and fixed.\n`;
         const fixedLogContent = `${cleanedLogContent}${machineLogEntry}`;
 
-        // Recalculate the hash and signature for the fixed log content
+        
         const newHash = crypto.createHash('sha256').update(fixedLogContent).digest('hex');
         const sign = crypto.createSign('sha256');
         sign.update(newHash);
-        const newSignature = sign.sign(this.settings.privateKey, 'hex');
+        const newSignature = sign.sign(this.privateKey!, 'hex');
 
-        // Append the new hash and signature
+        
         const finalLogContent = `${fixedLogContent}\nHASH: ${newHash}\nSIGNATURE: ${newSignature}\n`;
 
-        // Write the fixed log content to the file
+        
         await this.app.vault.adapter.write(logFilePath, finalLogContent);
     }
 
-    // Check text consistency between the logfile and the actual file
     async checkTextConsistency(logFilePath: string) {
         try {
             const logContent = await this.app.vault.adapter.read(logFilePath);
-
-            // Reconstruct the text from the logfile
             const reconstructedText = this.reconstructTextFromLog(logContent);
 
-            // Read the actual file content
-            const actualContent = await this.app.vault.adapter.read(this.currentFilePath!);
+            let actualContent: string;
+            try {
+                actualContent = await this.app.vault.adapter.read(this.activeFilePath!);
+            } catch (error) {
+                console.error(`Error reading current file content from ${this.activeFilePath}:`, error);
+                throw new Error(`Failed to read current file content: ${error.message}`);
+            }
 
-            // Compare the reconstructed text with the actual file content
             if (reconstructedText !== actualContent) {
-                // Text is inconsistent, fix it
                 await this.fixTextInconsistency(logContent, reconstructedText, actualContent, logFilePath);
             }
         } catch (error) {
-            // File does not exist or is empty, ignore
+            console.error('Error during text consistency check:', error);
+            // Re-throw the error to allow proper handling by the caller
+            throw error;
         }
     }
 
-    // Reconstruct the text from the logfile
     reconstructTextFromLog(logContent: string): string {
         let text = '';
         const lines = logContent.split('\n');
 
         for (const line of lines) {
-            if (line.startsWith('+') || line.startsWith('-') || line.startsWith('[MACHINE]')) {
-                const match = line.match(/^\[MACHINE\] @(\d+) ([+-])(.*)$/) ||
-                              line.match(/^([+-])(\d+) @(\d+) (.*)$/);
-                if (match) {
-                    const type = match[2];
-                    const position = parseInt(match[3], 10);
-                    const changeText = match[4];
+            // Skip empty lines or lines with hash/signature
+            if (!line || line.startsWith('HASH:') || line.startsWith('SIGNATURE:')) {
+                continue;
+            }
 
-                    if (type === '+') {
-                        text = text.slice(0, position) + changeText + text.slice(position);
-                    } else if (type === '-') {
-                        text = text.slice(0, position) + text.slice(position + changeText.length);
-                    }
+            let match: RegExpMatchArray | null;
+
+            // Format 1: [MACHINE] @position +-text
+            if ((match = line.match(/^\[MACHINE\] @(\d+) ([+-])(.*)$/))) {
+                const [, position, type, changeText] = match;
+                const pos = parseInt(position, 10);
+                const unescapedText = this.unescapeText(changeText);
+
+                if (type === '+') {
+                    text = text.slice(0, pos) + unescapedText + text.slice(pos);
+                } else if (type === '-') {
+                    text = text.slice(0, pos) + text.slice(pos + unescapedText.length);
+                }
+            }
+            // Format 2: [ISO_TIMESTAMP] {holdTime} @position +-text
+            else if ((match = line.match(/^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\] \{(\d+)\} @(\d+) ([+-])(.*)$/))) {
+                const [, , position, type, changeText] = match;
+                const pos = parseInt(position, 10);
+                const unescapedText = this.unescapeText(changeText);
+
+                if (type === '+') {
+                    text = text.slice(0, pos) + unescapedText + text.slice(pos);
+                } else if (type === '-') {
+                    text = text.slice(0, pos) + text.slice(pos + unescapedText.length);
+                }
+            }
+            // Format 3: +relativeTime {holdTime} @position +-text
+            else if ((match = line.match(/^\+(\d+) \{(\d+)\} @(\d+) ([+-])(.*)$/))) {
+                const [, , , position, type, changeText] = match;
+                const pos = parseInt(position, 10);
+                const unescapedText = this.unescapeText(changeText);
+
+                if (type === '+') {
+                    text = text.slice(0, pos) + unescapedText + text.slice(pos);
+                } else if (type === '-') {
+                    text = text.slice(0, pos) + text.slice(pos + unescapedText.length);
                 }
             }
         }
@@ -154,181 +299,262 @@ export default class EditorChangeTracker extends Plugin {
         return text;
     }
 
-    // Fix text inconsistency
+    private unescapeText(text: string): string {
+        return text
+            .replace(/\\n/g, '\n')
+            .replace(/\\([+@\[\]\\])/g, '$1');
+    }
+
     async fixTextInconsistency(logContent: string, reconstructedText: string, actualContent: string, logFilePath: string) {
         const diffs = this.calculateDiffForFixTextInconsistency(reconstructedText, actualContent);
 
         if (diffs.length > 0) {
-            let fixedLogContent = logContent;
+            // Clean up existing hash and signature before appending fixes
+            let fixedLogContent = logContent.replace(/\nHASH: .*\nSIGNATURE: .*\n$/, '');
+            
             for (const diff of diffs) {
                 const { type, text, position } = diff;
                 const machineLogEntry = `[MACHINE] @${position} ${type}${this.escapeText(text)}\n`;
                 fixedLogContent += machineLogEntry;
             }
 
-            // Recalculate the hash and signature for the fixed log content
             const newHash = crypto.createHash('sha256').update(fixedLogContent).digest('hex');
             const sign = crypto.createSign('sha256');
             sign.update(newHash);
-            const newSignature = sign.sign(this.settings.privateKey, 'hex');
+            const newSignature = sign.sign(this.privateKey!, 'hex');
 
-            // Append the new hash and signature
             const finalLogContent = `${fixedLogContent}\nHASH: ${newHash}\nSIGNATURE: ${newSignature}\n`;
 
-            // Write the fixed log content to the file
             await this.app.vault.adapter.write(logFilePath, finalLogContent);
         }
     }
 
-    // Log the change with timing and position
-    logChange(previousContent: string, currentContent: string, cursorPosition: { line: number, ch: number }) {
+    logChange(fileState: FileState, currentContent: string, cursorPosition: { line: number, ch: number }) {
         const now = Date.now();
         let logEntry = '';
-
-        if (this.lastLogTime === null) {
-            // Log the full timestamp if lastLogTime is null
+        console.log(currentContent);
+        if (fileState.lastLogTime === null) {
             logEntry = `[${new Date(now).toISOString()}] `;
         } else {
-            const timeDiff = now - this.lastLogTime;
+            const timeDiff = now - fileState.lastLogTime;
             if (timeDiff > 60000) {
-                // Log the full timestamp if the time difference is greater than 1 minute
                 logEntry = `[${new Date(now).toISOString()}] `;
             } else {
-                // Log the relative time difference
                 logEntry = `+${timeDiff} `;
             }
         }
 
-        // Calculate the difference between the previous and current content
-        const diff = this.calculateDiffForLogChange(previousContent, currentContent, cursorPosition);
+        const diff = this.calculateDiffForLogChange(fileState.previousContent, currentContent, cursorPosition);
 
-        // Add the change to the log buffer
         if (diff) {
             const { type, text, position } = diff;
-            logEntry += `@${position} ${type}${this.escapeText(text)}\n`;
-            this.logBuffer.push(logEntry);
+            const keyHoldTime = this.calculateKeyHoldTime(fileState, text);
+            logEntry += `{${keyHoldTime}} @${position} ${type}${this.escapeText(text)}\n`;
+            fileState.logBuffer.push(logEntry);
+            fileState.lastLogTime = now;
         }
-
-        // Update lastLogTime
-        this.lastLogTime = now;
-
-        // Debounce writing to file
-        this.debounceWriteToFile();
+        
+        this.debounceWriteToFile(fileState);
     }
 
-    // Debounce writing to file
-    debounceWriteToFile() {
-        if (this.writeTimeout) {
-            clearTimeout(this.writeTimeout);
+    debounceWriteToFile(fileState: FileState) {
+        if (fileState.writeTimeout) {
+            clearTimeout(fileState.writeTimeout);
         }
 
-        this.writeTimeout = window.setTimeout(() => {
-            this.writeLogBufferToFile();
-        }, 1000); // 1-second debounce
+        fileState.writeTimeout = window.setTimeout(() => {
+            this.writeLogBufferToFile(fileState);
+        }, 1000);
     }
 
-    // Write the log buffer to file
-    async writeLogBufferToFile() {
-        if (this.logBuffer.length === 0) return;
+    async writeLogBufferToFile(fileState: FileState) {
+        if (fileState.logBuffer.length === 0) return;
 
         const logFilePath = this.getLogFilePath();
         if (!logFilePath) return;
 
-        // Join the log buffer into a single string
-        const logContent = this.logBuffer.join('');
-        this.logBuffer = []; // Clear the buffer
+        const logContent = fileState.logBuffer.join('');
+        fileState.logBuffer = [];
 
-        // Read the existing log file (if it exists)
         let existingLogContent = '';
         try {
             existingLogContent = await this.app.vault.adapter.read(logFilePath);
         } catch (error) {
-            // File does not exist yet, ignore
+            
         }
 
-        // Remove previous hashes and signatures from the existing log content
         const cleanedLogContent = existingLogContent.replace(/\nHASH: .*\nSIGNATURE: .*\n/g, '');
 
-        // Combine the cleaned existing log content with the new log content
         const fullLogContent = cleanedLogContent + logContent;
 
-        // Calculate the hash of the full log content (excluding previous hashes and signatures)
         const hash = crypto.createHash('sha256').update(fullLogContent).digest('hex');
 
         let signature: string;
         try {
             if (this.settings.isScript) {
-                // Use external script to sign the hash
                 signature = await this.signWithExternalScript(hash);
             } else {
-                // Read private key from file and sign
-                const privateKey = await this.app.vault.adapter.read(this.settings.keyPath);
+                if (!this.privateKey) {
+                    throw new Error('Private key not loaded');
+                }
                 const sign = crypto.createSign('sha256');
                 sign.update(hash);
-                signature = sign.sign(privateKey, 'hex');
+                signature = sign.sign(this.privateKey, 'hex');
             }
         } catch (err) {
-            console.error('Failed to sign the hash. Please check your key file or signing script.');
+            console.error('Failed to sign the hash:', err);
             throw new Error('Signing failed: ' + err.message);
         }
 
-        // Append the hash and signature to the log content
         const finalLogContent = `${fullLogContent}\nHASH: ${hash}\nSIGNATURE: ${signature}\n`;
 
-        // Write the final log content to the file
         await this.app.vault.adapter.write(logFilePath, finalLogContent);
     }
 
-    // New method to handle external script signing
     private async signWithExternalScript(hash: string): Promise<string> {
-        return new Promise((resolve, reject) => {
-            const { exec } = require('child_process');
-            
-            exec(`"${this.settings.keyPath}" "${hash}"`, (error: Error, stdout: string, stderr: string) => {
-                if (error) {
-                    console.error(`Signing script error: ${error}`);
-                    reject(error);
-                    return;
+        return new Promise(async (resolve, reject) => {
+            try {
+                // Validate that the script path is within the vault
+                const normalizedPath = this.app.vault.adapter.getResourcePath(this.settings.keyPath);
+                const vaultRoot = this.app.vault.configDir;
+                
+                if (!normalizedPath.startsWith(vaultRoot)) {
+                    throw new Error('Script must be located within the Obsidian vault');
                 }
-                if (stderr) {
-                    console.error(`Signing script stderr: ${stderr}`);
+
+                // Verify the script exists
+                const exists = await this.app.vault.adapter.exists(this.settings.keyPath);
+                if (!exists) {
+                    throw new Error('Script file does not exist');
                 }
-                resolve(stdout.trim());
-            });
+
+                // Read and validate script content
+                const scriptContent = await this.app.vault.adapter.read(this.settings.keyPath);
+                if (scriptContent.length > 10000) { // Reasonable size limit
+                    throw new Error('Script file is too large');
+                }
+
+                // Basic script content validation
+                if (!/^[\x20-\x7E\n\r\t]*$/.test(scriptContent)) {
+                    throw new Error('Script contains invalid characters');
+                }
+
+                // Use spawn instead of exec for better security
+                const { spawn } = require('child_process');
+                const child = spawn(normalizedPath, [hash], {
+                    cwd: vaultRoot,
+                    shell: false,
+                    timeout: 5000, // 5 second timeout
+                    env: {}, // No environment variables passed
+                    stdio: ['ignore', 'pipe', 'pipe']
+                });
+
+                let stdout = '';
+                let stderr = '';
+
+                child.stdout.on('data', (data: Buffer) => {
+                    stdout += data.toString();
+                });
+
+                child.stderr.on('data', (data: Buffer) => {
+                    stderr += data.toString();
+                });
+
+                child.on('error', (error: Error) => {
+                    reject(new Error(`Script execution failed: ${error.message}`));
+                });
+
+                child.on('close', (code: number) => {
+                    if (code !== 0) {
+                        reject(new Error(`Script exited with code ${code}: ${stderr}`));
+                        return;
+                    }
+                    resolve(stdout.trim());
+                });
+            } catch (error) {
+                reject(new Error(`Script validation failed: ${error.message}`));
+            }
         });
     }
 
-    // Calculate the difference between two strings for logChange
-    calculateDiffForLogChange(previous: string, current: string, cursorPosition: { line: number, ch: number }): { type: string, text: string, position: number } | null {
+    calculateDiffForLogChange(previous: string | undefined, current: string | undefined, cursorPosition: { line: number, ch: number }): { type: string, text: string, position: number } | null {
+        // Handle undefined/null inputs
+        if (!previous || !current) {
+            return null;
+        }
+
         const cursorOffset = this.getCursorOffset(previous, cursorPosition);
 
-        // Find the first difference near the cursor
-        let start = Math.max(0, cursorOffset - 100); // Look 100 characters before the cursor
-        let end = Math.min(previous.length, cursorOffset + 100); // Look 100 characters after the cursor
+        // Focus on a small window around cursor for performance
+        const windowSize = 100; // Increased window size to better handle multiline changes
+        const start = Math.max(0, cursorOffset - windowSize);
+        const end = Math.min(
+            Math.min(previous.length, current.length),
+            cursorOffset + windowSize
+        );
 
-        // Compare the text around the cursor
+        // Find first difference in the window
         for (let i = start; i < end; i++) {
             if (previous[i] !== current[i]) {
-                // Determine if it's an addition or deletion
-                if (current.length > previous.length) {
-                    const addedText = current.slice(i, i + (current.length - previous.length));
-                    return { type: '+', text: addedText, position: i };
-                } else if (current.length < previous.length) {
-                    const removedText = previous.slice(i, i + (previous.length - current.length));
-                    return { type: '-', text: removedText, position: i };
-                } else {
-                    // Handle replacement (e.g., pasting over selected text)
-                    const addedText = current.slice(i, i + 1);
-                    const removedText = previous.slice(i, i + 1);
-                    return { type: '+', text: addedText, position: i };
+            // Handle deletion
+            if (current.length < previous.length) {
+                    // Find how many chars were deleted
+                let j = 0;
+                while (i + j < previous.length && 
+                           (i >= current.length || previous[i + j] !== current[i])) {
+                    j++;
                 }
+                return {
+                    type: '-',
+                    text: previous.slice(i, i + j),
+                    position: i
+                };
+            }
+            // Handle insertion
+                else if (current.length > previous.length) {
+                    // Find how many chars were inserted
+                let j = 0;
+                while (i + j < current.length && 
+                           (i >= previous.length || current[i + j] !== previous[i])) {
+                    j++;
+                }
+                return {
+                    type: '+',
+                    text: current.slice(i, i + j),
+                    position: i
+                };
+            }
+                // Handle single char replacement
+        else {
+                    // Look for a sequence of changed characters
+                let j = 0;
+                    while (i + j < current.length && 
+                           i + j < previous.length && 
+                           current[i + j] !== previous[i + j]) {
+                    j++;
+                }
+                return {
+                    type: '+',
+                    text: current.slice(i, i + j),
+                    position: i
+                };
+            }
             }
         }
 
-        return null; // No change detected
-    }
+        // Handle appending at end of file
+        if (current.length > previous.length && 
+            current.startsWith(previous)) {
+            return {
+                type: '+',
+                text: current.slice(previous.length),
+                position: previous.length
+            };
+        }
 
-    // Calculate the difference between two strings for fixTextInconsistency
+        return null;
+    }
+    
     calculateDiffForFixTextInconsistency(previous: string, current: string): { type: string, text: string, position: number }[] {
         const diffs: { type: string, text: string, position: number }[] = [];
         let i = 0;
@@ -341,15 +567,29 @@ export default class EditorChangeTracker extends Plugin {
             } else {
                 // Handle additions
                 if (j < current.length && (i >= previous.length || previous[i] !== current[j])) {
-                    const addedText = current[j];
-                    diffs.push({ type: '+', text: addedText, position: i });
-                    j++;
+                    const startPos = i;
+                    let addedText = '';
+                    
+                    // Collect consecutive additions
+                    while (j < current.length && (i >= previous.length || previous[i] !== current[j])) {
+                        addedText += current[j];
+                        j++;
+                    }
+                    
+                    diffs.push({ type: '+', text: addedText, position: startPos });
                 }
-                // Handle deletions
+                // Handle deletions 
                 else if (i < previous.length && (j >= current.length || previous[i] !== current[j])) {
-                    const removedText = previous[i];
-                    diffs.push({ type: '-', text: removedText, position: i });
-                    i++;
+                    const startPos = i;
+                    let removedText = '';
+                    
+                    // Collect consecutive deletions
+                    while (i < previous.length && (j >= current.length || previous[i] !== current[j])) {
+                        removedText += previous[i];
+                        i++;
+                    }
+                    
+                    diffs.push({ type: '-', text: removedText, position: startPos });
                 }
             }
         }
@@ -357,44 +597,58 @@ export default class EditorChangeTracker extends Plugin {
         return diffs;
     }
 
-    // Get the cursor offset in the text
-    getCursorOffset(text: string, cursorPosition: { line: number, ch: number }): number {
+    getCursorOffset(text: string | undefined, cursorPosition: { line: number, ch: number }): number {
+        // Handle undefined/null text
+        if (!text) {
+            return 0;
+        }
+
         const lines = text.split('\n');
         let offset = 0;
 
-        for (let i = 0; i < cursorPosition.line; i++) {
-            offset += lines[i].length + 1; // +1 for the newline character
+        // Ensure we don't go beyond the actual number of lines
+        const maxLine = Math.min(cursorPosition.line, lines.length - 1);
+        for (let i = 0; i < maxLine; i++) {
+            offset += (lines[i]?.length ?? 0) + 1; // Use optional chaining and nullish coalescing
         }
 
-        offset += cursorPosition.ch;
+        // Add the final line's offset, ensuring we don't exceed the line length
+        if (lines[maxLine]) {
+            offset += Math.min(cursorPosition.ch, lines[maxLine].length);
+        }
+
         return offset;
     }
 
-    // Escape special characters in the text
     escapeText(text: string): string {
-        return text.replace(/[+@\[\]]/g, '\\$&');
+        return text
+            .replace(/[+@\[\]\\]/g, '\\$&')  // Escape special characters
+            .replace(/\n/g, '\\n');  // Escape newlines
     }
 
     async loadSettings() {
         this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
         
-        // If no key path is specified, use default path in .obsidian folder
+        
         if (!this.settings.keyPath) {
             this.settings.keyPath = '.obsidian/private_key.pem';
             await this.saveSettings();
+        }
+        
+        try {
             
-            // Check if key file exists, if not generate one
-            try {
-                await this.app.vault.adapter.read(this.settings.keyPath);
-            } catch {
+            const keyExists = await this.app.vault.adapter.exists(this.settings.keyPath);
+            if (!keyExists || !(await this.validatePrivateKey(this.settings.keyPath))) {
                 await this.generateAndSavePrivateKey();
             }
+        } catch (error) {
+            console.error('Error checking/generating private key:', error);
+            throw new Error('Failed to initialize private key: ' + error.message);
         }
     }
 
     private async generateAndSavePrivateKey(): Promise<void> {
         try {
-            // Generate key pair using Node's crypto module
             const { generateKeyPair } = require('crypto');
             const { promisify } = require('util');
             const generateKeyPairAsync = promisify(generateKeyPair);
@@ -407,12 +661,17 @@ export default class EditorChangeTracker extends Plugin {
                 },
                 privateKeyEncoding: {
                     type: 'pkcs8',
-                    format: 'pem'
+                    format: 'pem',
+                    cipher: undefined,  
+                    passphrase: undefined  
                 }
             });
 
-            // Save the private key
-            await this.app.vault.adapter.write(this.settings.keyPath, privateKey);
+            
+            const formattedKey = privateKey.replace(/\r\n/g, '\n').trim() + '\n';
+
+            
+            await this.app.vault.adapter.write(this.settings.keyPath, formattedKey);
             
             console.log('Generated and saved new private key at:', this.settings.keyPath);
         } catch (error) {
@@ -421,8 +680,142 @@ export default class EditorChangeTracker extends Plugin {
         }
     }
 
+    
+    private async validatePrivateKey(keyPath: string): Promise<boolean> {
+        try {
+            const privateKey = await this.app.vault.adapter.read(keyPath);
+            
+            
+            const pemRegex = /^-----BEGIN PRIVATE KEY-----\n[\s\S]*\n-----END PRIVATE KEY-----\n?$/;
+            if (!pemRegex.test(privateKey.trim())) {
+                console.error('Invalid private key format');
+                return false;
+            }
+
+            
+            const sign = crypto.createSign('sha256');
+            sign.update('test');
+            sign.sign(privateKey, 'hex');
+            
+            return true;
+        } catch (error) {
+            console.error('Private key validation failed:', error);
+            return false;
+        }
+    }
+
     async saveSettings() {
         await this.saveData(this.settings);
+    }
+
+    cleanupStaleKeyPressTimes(fileState: FileState) {
+        const now = Date.now();
+        for (const [key, startTime] of fileState.keyPressMap.entries()) {
+            if (startTime === -1 || now - startTime > 60000) {
+                fileState.keyPressMap.delete(key);
+            }
+        }
+    }
+
+    calculateKeyHoldTime(fileState: FileState, text: string): number {
+        let keyHoldTime = 0;
+
+        for (const char of text) {
+            if (fileState.keyPressMap.has(char)) {
+                const keyPressStartTime = fileState.keyPressMap.get(char)!;
+                if (keyPressStartTime !== -1) {
+                    keyHoldTime += window.performance.now() - keyPressStartTime;
+                }
+                fileState.keyPressMap.delete(char);
+            }
+        }
+
+        // Convert to microseconds (1 millisecond = 1000 microseconds)
+        return Math.round(keyHoldTime * 1000);
+    }
+
+    private async verifyWithExternalScript(hash: string, signature: string): Promise<boolean> {
+        return new Promise(async (resolve, reject) => {
+            try {
+                // Validate that the script path is within the vault
+                const normalizedPath = this.app.vault.adapter.getResourcePath(this.settings.keyPath);
+                const vaultRoot = this.app.vault.configDir;
+                
+                if (!normalizedPath.startsWith(vaultRoot)) {
+                    throw new Error('Script must be located within the Obsidian vault');
+                }
+
+                // Verify the script exists
+                const exists = await this.app.vault.adapter.exists(this.settings.keyPath);
+                if (!exists) {
+                    throw new Error('Script file does not exist');
+                }
+
+                // Read and validate script content
+                const scriptContent = await this.app.vault.adapter.read(this.settings.keyPath);
+                if (scriptContent.length > 10000) { // Reasonable size limit
+                    throw new Error('Script file is too large');
+                }
+
+                // Basic script content validation
+                if (!/^[\x20-\x7E\n\r\t]*$/.test(scriptContent)) {
+                    throw new Error('Script contains invalid characters');
+                }
+
+                // Use spawn instead of exec for better security
+                const { spawn } = require('child_process');
+                const child = spawn(normalizedPath, [hash, signature], {
+                    cwd: vaultRoot,
+                    shell: false,
+                    timeout: 5000, // 5 second timeout
+                    env: {}, // No environment variables passed
+                    stdio: ['ignore', 'pipe', 'pipe']
+                });
+
+                let stdout = '';
+                let stderr = '';
+
+                child.stdout.on('data', (data: Buffer) => {
+                    stdout += data.toString();
+                });
+
+                child.stderr.on('data', (data: Buffer) => {
+                    stderr += data.toString();
+                });
+
+                child.on('error', (error: Error) => {
+                    reject(new Error(`Script execution failed: ${error.message}`));
+                });
+
+                child.on('close', (code: number) => {
+                    if (code !== 0) {
+                        reject(new Error(`Script exited with code ${code}: ${stderr}`));
+                        return;
+                    }
+                    resolve(stdout.trim().toLowerCase() === 'true');
+                });
+            } catch (error) {
+                reject(new Error(`Script validation failed: ${error.message}`));
+            }
+        });
+    }
+
+    async onunload() {
+        // Write any pending log buffer entries before cleanup
+        const writePromises = Array.from(this.fileStates.values()).map(async (fileState) => {
+            if (fileState.writeTimeout !== null) {
+                clearTimeout(fileState.writeTimeout);
+                fileState.writeTimeout = null;
+            }
+            // Write any remaining log buffer entries
+            await this.writeLogBufferToFile(fileState);
+        });
+
+        // Wait for all writes to complete
+        await Promise.all(writePromises);
+        
+        // Clear the file states
+        this.fileStates.clear();
     }
 }
 
