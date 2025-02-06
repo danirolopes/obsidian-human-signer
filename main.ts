@@ -346,7 +346,6 @@ export default class EditorChangeTracker extends Plugin {
     logChange(fileState: FileState, currentContent: string, cursorPosition: { line: number, ch: number }) {
         const now = Date.now();
         let logEntry = '';
-        console.log(currentContent);
         if (fileState.lastLogTime === null) {
             logEntry = `[${new Date(now).toISOString()}] `;
         } else {
