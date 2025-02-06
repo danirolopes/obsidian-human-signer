@@ -139,18 +139,62 @@ export default class EditorChangeTracker extends Plugin {
             }
         }, 60000);
 
+        // Add file rename event handler
+        this.registerEvent(
+            this.app.vault.on('rename', async (file, oldPath) => {
+                if (this.fileStates.has(oldPath)) {
+                    // Get the old file state
+                    const fileState = this.fileStates.get(oldPath)!;
+                    
+                    // Write any pending changes before moving
+                    await this.writeLogBufferToFile(fileState);
+                    
+                    // Update the file state with new path
+                    fileState.filePath = file.path;
+                    this.fileStates.delete(oldPath);
+                    this.fileStates.set(file.path, fileState);
+                    
+                    // Move the log file to match the new file path
+                    const oldLogPath = this.getLogFilePathForPath(oldPath);
+                    const newLogPath = this.getLogFilePathForPath(file.path);
+                    
+                    if (oldLogPath && newLogPath) {
+                        try {
+                            // Check if old log file exists
+                            if (await this.app.vault.adapter.exists(oldLogPath)) {
+                                // Read old log content
+                                const logContent = await this.app.vault.adapter.read(oldLogPath);
+                                // Write to new location
+                                await this.app.vault.adapter.write(newLogPath, logContent);
+                                // Delete old log file
+                                await this.app.vault.adapter.remove(oldLogPath);
+                            }
+                        } catch (error) {
+                            console.error('Error moving log file:', error);
+                        }
+                    }
+                    
+                    if (this.activeFilePath === oldPath) {
+                        this.activeFilePath = file.path;
+                    }
+                }
+            })
+        );
+
         this.addSettingTab(new EditorChangeTrackerSettingTab(this.app, this));
     }
-    getLogFilePath(): string | null {
-        if (!this.activeFilePath) return null;
+
+    // Add helper method to get log file path for any file path
+    getLogFilePathForPath(filePath: string): string | null {
+        if (!filePath) return null;
         
         // Get the vault root path
         const vaultRoot = this.app.vault.configDir;
         
         // Get relative path from vault root
-        const relativePath = this.activeFilePath.startsWith(vaultRoot) ? 
-            this.activeFilePath.slice(vaultRoot.length + 1) : 
-            this.activeFilePath;
+        const relativePath = filePath.startsWith(vaultRoot) ? 
+            filePath.slice(vaultRoot.length + 1) : 
+            filePath;
             
         // Split path into directory and filename
         const lastSlashIndex = relativePath.lastIndexOf('/');
@@ -160,6 +204,12 @@ export default class EditorChangeTracker extends Plugin {
         // Create log file path by adding dot prefix to filename
         const logFileName = directory + '.' + filename.replace(/\.[^/.]+$/, '') + '.log';
         return logFileName;
+    }
+
+    // Update the existing getLogFilePath method to use the helper
+    getLogFilePath(): string | null {
+        if (!this.activeFilePath) return null;
+        return this.getLogFilePathForPath(this.activeFilePath);
     }
 
     async checkLogfileConsistency() {
