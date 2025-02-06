@@ -542,6 +542,13 @@ export default class EditorChangeTracker extends Plugin {
 
     calculateDiffForLogChange(previous: string | undefined, current: string | undefined, cursorPosition: { line: number, ch: number }): { type: string, text: string, position: number } | null {
         // Handle undefined/null inputs
+        if (previous == "" && current) {
+            return {
+                type: '+',
+                text: current,
+                position: 0
+            };
+        }
         if (!previous || !current) {
             return null;
         }
