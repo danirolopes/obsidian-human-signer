@@ -744,7 +744,7 @@ export default class EditorChangeTracker extends Plugin {
             await this.app.vault.adapter.write(this.settings.keyPath, formattedPrivateKey);
             
             // Save public key alongside private key
-            const publicKeyPath = this.settings.keyPath.replace('.pem', '.pub.pem');
+            const publicKeyPath = this.settings.keyPath.replace('.pem', '.pub.pem').replace('private', 'public');
             const formattedPublicKey = publicKey.replace(/\r\n/g, '\n').trim() + '\n';
             await this.app.vault.adapter.write(publicKeyPath, formattedPublicKey);
             
