@@ -141,10 +141,24 @@ export default class EditorChangeTracker extends Plugin {
 
         this.addSettingTab(new EditorChangeTrackerSettingTab(this.app, this));
     }
-
     getLogFilePath(): string | null {
         if (!this.activeFilePath) return null;
-        const logFileName = `.${this.activeFilePath.replace(/\.[^/.]+$/, '')}.log`;
+        
+        // Get the vault root path
+        const vaultRoot = this.app.vault.configDir;
+        
+        // Get relative path from vault root
+        const relativePath = this.activeFilePath.startsWith(vaultRoot) ? 
+            this.activeFilePath.slice(vaultRoot.length + 1) : 
+            this.activeFilePath;
+            
+        // Split path into directory and filename
+        const lastSlashIndex = relativePath.lastIndexOf('/');
+        const directory = lastSlashIndex >= 0 ? relativePath.slice(0, lastSlashIndex + 1) : '';
+        const filename = lastSlashIndex >= 0 ? relativePath.slice(lastSlashIndex + 1) : relativePath;
+            
+        // Create log file path by adding dot prefix to filename
+        const logFileName = directory + '.' + filename.replace(/\.[^/.]+$/, '') + '.log';
         return logFileName;
     }
 
