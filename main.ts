@@ -128,7 +128,9 @@ export default class EditorChangeTracker extends Plugin {
 
             const key = event.key;
             if (fileState.keyPressMap.has(key)) {
-                fileState.keyPressMap.set(key, -1);
+                setTimeout(() => {
+                    fileState.keyPressMap.delete(key)
+                }, 1000);
             }
         });
 
