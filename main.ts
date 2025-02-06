@@ -725,7 +725,7 @@ export default class EditorChangeTracker extends Plugin {
             const { promisify } = require('util');
             const generateKeyPairAsync = promisify(generateKeyPair);
 
-            const { privateKey } = await generateKeyPairAsync('rsa', {
+            const { privateKey, publicKey } = await generateKeyPairAsync('rsa', {
                 modulusLength: 2048,
                 publicKeyEncoding: {
                     type: 'spki',
@@ -739,16 +739,20 @@ export default class EditorChangeTracker extends Plugin {
                 }
             });
 
+            // Format and save private key
+            const formattedPrivateKey = privateKey.replace(/\r\n/g, '\n').trim() + '\n';
+            await this.app.vault.adapter.write(this.settings.keyPath, formattedPrivateKey);
             
-            const formattedKey = privateKey.replace(/\r\n/g, '\n').trim() + '\n';
-
-            
-            await this.app.vault.adapter.write(this.settings.keyPath, formattedKey);
+            // Save public key alongside private key
+            const publicKeyPath = this.settings.keyPath.replace('.pem', '.pub.pem');
+            const formattedPublicKey = publicKey.replace(/\r\n/g, '\n').trim() + '\n';
+            await this.app.vault.adapter.write(publicKeyPath, formattedPublicKey);
             
             console.log('Generated and saved new private key at:', this.settings.keyPath);
+            console.log('Generated and saved new public key at:', publicKeyPath);
         } catch (error) {
-            console.error('Failed to generate private key:', error);
-            throw new Error('Failed to generate private key: ' + error.message);
+            console.error('Failed to generate keys:', error);
+            throw new Error('Failed to generate keys: ' + error.message);
         }
     }
 

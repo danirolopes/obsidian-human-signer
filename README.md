@@ -16,9 +16,9 @@ A secure and reliable plugin for Obsidian that tracks and logs all changes made 
   - Automatic detection and fixing of log inconsistencies
 
 - **Flexible Configuration**:
-  - Support for custom private key location
+  - Support for custom private/public key location
   - Option to use external signing scripts
-  - Automatic key generation if none exists
+  - Automatic key pair generation if none exists
 
 ## Installation
 
@@ -32,8 +32,9 @@ A secure and reliable plugin for Obsidian that tracks and logs all changes made 
 
 1. Go to Settings > Editor Change Tracker
 2. Configure the key path:
-   - Default: `.obsidian/private_key.pem`
-   - Can be changed to a custom path or script location
+   - Default private key: `.obsidian/private_key.pem`
+   - Default public key: `.obsidian/private_key.pub.pem`
+   - Both can be changed to custom paths or script locations
 
 ## How It Works
 
@@ -52,10 +53,11 @@ All logs are automatically verified for consistency and integrity using:
 ## Security
 
 The plugin uses industry-standard cryptographic methods to ensure the integrity of your editing history:
-- RSA private/public key encryption
+- RSA private/public key pair for asymmetric encryption
 - SHA-256 hashing for content verification
 - Automatic validation of log file integrity
 - Secure storage of cryptographic keys
+- Public key available for external verification
 
 ## Development
 
