@@ -726,7 +726,7 @@ export default class EditorChangeTracker extends Plugin {
             const generateKeyPairAsync = promisify(generateKeyPair);
 
             const { privateKey, publicKey } = await generateKeyPairAsync('rsa', {
-                modulusLength: 2048,
+                modulusLength: 4096,
                 publicKeyEncoding: {
                     type: 'spki',
                     format: 'pem'
