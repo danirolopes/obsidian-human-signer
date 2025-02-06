@@ -183,6 +183,42 @@ export default class EditorChangeTracker extends Plugin {
             })
         );
 
+        // Add file delete event handler
+        this.registerEvent(
+            this.app.vault.on('delete', async (file) => {
+                if (this.fileStates.has(file.path)) {
+                    // Get the file state
+                    const fileState = this.fileStates.get(file.path)!;
+                    
+                    if (fileState) {
+                        await this.writeLogBufferToFile(fileState);
+                    }
+                    
+                    // Get the log file path
+                    const logFilePath = this.getLogFilePathForPath(file.path);
+                    
+                    if (logFilePath) {
+                        try {
+                            // Delete the log file if it exists
+                            if (await this.app.vault.adapter.exists(logFilePath)) {
+                                await this.app.vault.adapter.remove(logFilePath);
+                            }
+                        } catch (error) {
+                            console.error('Error deleting log file:', error);
+                        }
+                    }
+                    
+                    // Clean up the file state
+                    fileState.reset();
+                    this.fileStates.delete(file.path);
+                    
+                    if (this.activeFilePath === file.path) {
+                        this.activeFilePath = null;
+                    }
+                }
+            })
+        );
+
         this.addSettingTab(new EditorChangeTrackerSettingTab(this.app, this));
     }
 
